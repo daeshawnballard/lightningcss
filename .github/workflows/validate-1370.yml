@@ -1,0 +1,87 @@
+name: Validate Lightning CSS 1370
+
+on:
+  push:
+    branches: [ci/validate-container-error-recovery]
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    env:
+      PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 6093bcf3bd051d73779d08a273017e4f758c632c
+      - name: Confirm exact PR source
+        run: |
+          test "$(git rev-parse HEAD)" = 6093bcf3bd051d73779d08a273017e4f758c632c
+          git status --short
+          sha256sum src/parser.rs src/lib.rs node/test/transform.test.mjs Cargo.lock yarn.lock
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - run: yarn install --frozen-lockfile
+      - run: cargo fmt --all -- --check
+      - name: Rust all features
+        env:
+          RUSTFLAGS: -D warnings
+        run: cargo test --all-features
+      - run: yarn build
+      - name: Confirm fresh native artifact
+        run: |
+          test -s lightningcss.linux-x64-gnu.node
+          sha256sum lightningcss.linux-x64-gnu.node
+          node -p 'process.version + " " + process.platform + " " + process.arch'
+          rustc --version
+      - run: yarn test
+      - run: yarn tsc
+      - name: Public native Node API
+        shell: bash
+        run: |
+          node <<'NODE'
+          const assert = require('node:assert/strict');
+          const path = require('node:path');
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const {transform} = require('./');
+          const binary = path.join(process.cwd(), 'lightningcss.linux-x64-gnu.node');
+          assert.ok(require.cache[binary], 'public entry did not load the just-built native module');
+          const source = '@container scroll-content {\n  .foo { max-width: 100cqw; }\n}';
+          const expected = '@container scroll-content {\n  .foo {\n    max-width: 100cqw;\n  }\n}\n';
+          const report = transform({filename: 'issue-1370.css', code: Buffer.from(source), errorRecovery: true});
+          assert.equal(report.code.toString(), expected);
+          assert.deepEqual(report.warnings, []);
+          let passed = 0;
+          for (const css of [
+            source,
+            '@container scroll-content /* comment */ { .foo { max-width: 100cqw; } }',
+            '@supports (container-type: inline-size scroll-state) { @container scroll-content { .foo { max-width: 100cqw; } } }',
+            '.outer { @container scroll-content { .foo { max-width: 100cqw; } } }',
+            '@container scroll-content (width > 100px) { .foo { max-width: 100cqw; } }',
+            '@container (width > 100px) { .foo { max-width: 100cqw; } }'
+          ]) {
+            for (const minify of [false, true]) {
+              const options = {code: Buffer.from(css), minify};
+              const strict = transform({...options, errorRecovery: false});
+              const recovered = transform({...options, errorRecovery: true});
+              assert.deepEqual(recovered.warnings, []);
+              assert.equal(recovered.code.toString(), strict.code.toString());
+              console.log('PASS', {css, minify});
+              passed++;
+            }
+          }
+          for (const css of ['@container {}', '@container none {}', '@container foo () {}', '@container foo not {}', '@container foo bar {}']) {
+            const options = {code: Buffer.from(css)};
+            assert.throws(() => transform({...options, errorRecovery: false}));
+            assert.ok(transform({...options, errorRecovery: true}).warnings.length > 0);
+            console.log('PASS malformed boundary', css);
+            passed++;
+          }
+          console.log(JSON.stringify({passed, sourceCommit: '6093bcf3bd051d73779d08a273017e4f758c632c', binary, sha256: crypto.createHash('sha256').update(fs.readFileSync(binary)).digest('hex'), utc: new Date().toISOString()}));
+          assert.equal(passed, 17);
+          NODE
